@@ -291,6 +291,44 @@ class OWEASolver:
         traces = np.einsum("ij,nji->n", h_mat, self.info_matrices)
         return self.a1 * (traces - base)
 
+    def _greedy_init(self) -> tuple[list[int], Array]:
+        """Greedy Fedorov-style initialization.
+
+        Sequentially selects the k+1 most informative initial points using the
+        trace criterion  Tr(I_curr^{-1} I_x).  A candidate pool of ``20*k``
+        evenly spaced grid points is scanned per round (O(k^2) each), so the
+        total cost is O(k^3 * 20) – negligible even for large grids.
+        """
+        n = len(self.grid_points)
+        k = self.k
+        count = min(k + 1, n)
+
+        pool_size = min(n, 20 * k)
+        step = max(1, n // pool_size)
+        pool = list(range(0, n, step))[:pool_size]
+
+        # Seed: point with the largest Tr(I_x)
+        best_start = int(max(pool, key=lambda i: float(np.trace(self.info_matrices[i]))))
+        support = [best_start]
+        info_curr = self.info_matrices[best_start].copy() + np.eye(k) * 1e-12
+
+        for _ in range(count - 1):
+            inv_curr = np.linalg.inv(info_curr)
+            best_gain = -1.0
+            best_i = pool[0]
+            for i in pool:
+                if i in support:
+                    continue
+                gain = float(np.trace(inv_curr @ self.info_matrices[i]))
+                if gain > best_gain:
+                    best_gain = gain
+                    best_i = i
+            support.append(best_i)
+            info_curr += self.info_matrices[best_i]
+
+        weights = np.full(len(support), 1.0 / len(support))
+        return support, weights
+
     def solve(self) -> OWEAResult:
         t0 = time.perf_counter()
 
@@ -299,6 +337,14 @@ class OWEASolver:
         init_idx = np.linspace(0, n_grid - 1, init_count, dtype=int)
         support_idx = list(dict.fromkeys(init_idx.tolist()))
         weights = np.full(len(support_idx), 1.0 / len(support_idx))
+
+        # Check whether the linspace-chosen initial design is non-singular.
+        # Structured grids (e.g. factorial × continuous) can cause collinear
+        # selections; fall back to the greedy Fedorov-style initializer if so.
+        info_test = self._design_info_from_support(support_idx, weights)
+        total_test = self._combined_info(info_test)
+        if np.linalg.matrix_rank(total_test, tol=1e-10) < self.k:
+            support_idx, weights = self._greedy_init()
 
         best_max_d = float("inf")
         prev_best = float("inf")
@@ -349,8 +395,13 @@ class OWEASolver:
 
         info_xi = self._design_info_from_support(support_idx, weights)
         info_total = self._combined_info(info_xi)
-        sigma = self._sigma(info_total)
-        obj = self._tilde_phi(sigma)
+        try:
+            sigma = self._sigma(info_total)
+            obj = self._tilde_phi(sigma)
+        except np.linalg.LinAlgError:
+            # Degenerate support – return a large sentinel objective.
+            sigma = np.eye(self.v) * 1e30
+            obj = self._tilde_phi(sigma)
 
         return OWEAResult(
             support_indices=support_idx,
@@ -550,12 +601,208 @@ def run_example4_runtime_compare() -> None:
     print(f"ours: {res.elapsed_seconds:.3f}s, paper: {t_paper:.2f}s, ratio ours/paper: {res.elapsed_seconds / t_paper:.2f}")
 
 
+def build_info_logistic(grid: Array, theta: Array) -> Array:
+    """Vectorised Fisher-information matrices for the logistic model.
+
+    Predictor vector (matching the Julia `infor_vec`):
+        out = [1, A, B, ESD, Pulse, vol, ESD*Pulse]
+
+    The information vector at a single point is
+        f(x) = sqrt(p(x) * (1-p(x))) * out
+             = exp(xbeta/2) / (1 + exp(xbeta)) * out
+
+    so  I_x = f f^T  (rank-1 outer product).
+
+    Parameters
+    ----------
+    grid   : (N, 5)  columns are [A, B, ESD, Pulse, vol]
+    theta  : (7,)    intercept then seven predictor coefficients
+
+    Returns
+    -------
+    infos  : (N, 7, 7) array of information matrices
+    """
+    # Build the (N, 7) predictor matrix
+    out = np.column_stack([
+        np.ones(len(grid)),        # intercept
+        grid[:, 0],                # A
+        grid[:, 1],                # B
+        grid[:, 2],                # ESD
+        grid[:, 3],                # Pulse
+        grid[:, 4],                # vol
+        grid[:, 2] * grid[:, 3],   # ESD * Pulse
+    ])                             # shape (N, 7)
+
+    xbeta = out @ theta            # (N,)
+    # Numerically stable: clip to avoid overflow in exp
+    xbeta_clipped = np.clip(xbeta, -500.0, 500.0)
+    scale = np.exp(xbeta_clipped / 2.0) / (1.0 + np.exp(xbeta_clipped))  # sqrt(p*(1-p)), shape (N,)
+
+    f = scale[:, None] * out       # (N, 7)
+    return f[:, :, None] * f[:, None, :]  # (N, 7, 7)
+
+
+def build_logistic_grid() -> Array:
+    """Build the design grid matching the Julia code.
+
+    levels = [-1, 1]
+    vols   = 25 : 0.001 : 45   (20 001 values, both endpoints inclusive)
+    All 16 combinations of (A, B, ESD, Pulse) × 20 001 vol values = 320 016 rows.
+
+    Returns
+    -------
+    grid : (320016, 5)  columns [A, B, ESD, Pulse, vol]
+    """
+    levels = np.array([-1.0, 1.0])
+    vols = np.linspace(25.0, 45.0, 20001)   # (45-25)/0.001 + 1 = 20001
+
+    # Cartesian product of the four binary factors
+    A_v, B_v, ESD_v, Pulse_v = np.meshgrid(levels, levels, levels, levels, indexing="ij")
+    combos = np.column_stack([A_v.ravel(), B_v.ravel(), ESD_v.ravel(), Pulse_v.ravel()])  # (16, 4)
+
+    combos_rep = np.repeat(combos, len(vols), axis=0)         # (320016, 4)
+    vols_tile = np.tile(vols, len(combos))[:, None]           # (320016, 1)
+    return np.hstack([combos_rep, vols_tile])                  # (320016, 5)
+
+
+def run_example_logistic() -> None:
+    """Logistic model example translated from the Julia code."""
+    print("\n=== Logistic model (new example) ===")
+    theta = np.array([-7.5, 1.50, -0.2, -0.15, 0.25, 0.35, 0.4])
+
+    # ---- build grid --------------------------------------------------------
+    t_grid = time.perf_counter()
+    grid = build_logistic_grid()
+    print(f"Grid: {len(grid):,} points  ({time.perf_counter() - t_grid:.3f}s to build)")
+
+    # ---- compute info matrices (vectorised) --------------------------------
+    t_info = time.perf_counter()
+    infos = build_info_logistic(grid, theta)
+    print(f"Info matrices: computed in {time.perf_counter() - t_info:.3f}s  (shape {infos.shape})")
+
+    # ---- D-optimal design for all 7 parameters -----------------------------
+    solver = OWEASolver(
+        grid_points=grid,
+        info_matrices=infos,
+        g_jacobian=np.eye(7),
+        p=0,
+        eps_opt=1e-6,
+        max_outer_iter=300,
+    )
+    res = solver.solve()
+
+    max_d = res.max_directional_derivative
+    # D-efficiency lower bound: exp(-max_d / v)  (from the paper's Section 3)
+    d_eff_lb = math.exp(-max_d / 7.0) if max_d < 100 else 0.0
+
+    print(
+        f"\nD-optimal design found in {res.elapsed_seconds:.3f}s, "
+        f"{res.iterations} outer iterations"
+    )
+    print(f"Max directional derivative  = {max_d:.3e}  "
+          f"(D-efficiency lower bound ≥ {d_eff_lb:.4f})")
+    print(f"Objective  log|Σ|           = {res.objective_tilde:.6f}")
+
+    # Merge near-duplicate points (same binary combo, vol within 0.5)
+    pts = res.support_points   # (m, 5)
+    wts = res.weights          # (m,)
+    order = np.lexsort((pts[:, 4], pts[:, 2] * pts[:, 3], pts[:, 3], pts[:, 2], pts[:, 1], pts[:, 0]))
+
+    merged: list[tuple[np.ndarray, float]] = []
+    for i in order:
+        p, w = pts[i], float(wts[i])
+        if (
+            merged
+            and np.array_equal(p[:4], merged[-1][0][:4])          # same binary combo
+            and abs(p[4] - merged[-1][0][4]) < 0.5                 # vol within 0.5
+        ):
+            prev_p, prev_w = merged[-1]
+            new_w = prev_w + w
+            # weighted-average vol
+            merged_pt = prev_p.copy()
+            merged_pt[4] = (prev_p[4] * prev_w + p[4] * w) / new_w
+            merged[-1] = (merged_pt, new_w)
+        else:
+            merged.append((p.copy(), w))
+
+    print(f"Number of support points    = {len(merged)}  "
+          f"(before merge: {len(wts)})")
+    print("\n  A    B   ESD  Pulse    vol     weight")
+    print("  " + "-" * 44)
+    for p, w in merged:
+        print(
+            f"  {p[0]:+.0f}   {p[1]:+.0f}   {p[2]:+.0f}   {p[3]:+.0f}  {p[4]:7.3f}  {w:.4f}"
+        )
+
+
+def run_example_logistic_aopt() -> None:
+    """Logistic model example – A-optimality (p=1)."""
+    print("\n=== Logistic model: A-optimal design (p=1) ===")
+    theta = np.array([-7.5, 1.50, -0.2, -0.15, 0.25, 0.35, 0.4])
+
+    t_grid = time.perf_counter()
+    grid = build_logistic_grid()
+    print(f"Grid: {len(grid):,} points  ({time.perf_counter() - t_grid:.3f}s to build)")
+
+    t_info = time.perf_counter()
+    infos = build_info_logistic(grid, theta)
+    print(f"Info matrices: computed in {time.perf_counter() - t_info:.3f}s  (shape {infos.shape})")
+
+    solver = OWEASolver(
+        grid_points=grid,
+        info_matrices=infos,
+        g_jacobian=np.eye(7),
+        p=1,
+        eps_opt=1e-6,
+        max_outer_iter=300,
+    )
+    res = solver.solve()
+
+    print(
+        f"\nA-optimal design found in {res.elapsed_seconds:.3f}s, "
+        f"{res.iterations} outer iterations, "
+        f"max directional derivative = {res.max_directional_derivative:.3e}"
+    )
+    print(f"Number of support points: {len(res.weights)}")
+    print(f"Objective  Tr(Sigma)  = {res.objective_tilde:.6f}")
+
+    pts = res.support_points
+    wts = res.weights
+    order = np.lexsort((pts[:, 4], pts[:, 2] * pts[:, 3], pts[:, 3], pts[:, 2], pts[:, 1], pts[:, 0]))
+
+    merged: list[tuple[np.ndarray, float]] = []
+    for i in order:
+        p, w = pts[i], float(wts[i])
+        if (
+            merged
+            and np.array_equal(p[:4], merged[-1][0][:4])
+            and abs(p[4] - merged[-1][0][4]) < 0.5
+        ):
+            prev_p, prev_w = merged[-1]
+            new_w = prev_w + w
+            merged_pt = prev_p.copy()
+            merged_pt[4] = (prev_p[4] * prev_w + p[4] * w) / new_w
+            merged[-1] = (merged_pt, new_w)
+        else:
+            merged.append((p.copy(), w))
+
+    print(f"Support points after merging: {len(merged)}  (before merge: {len(wts)})")
+    print("\n  A    B   ESD  Pulse    vol     weight")
+    print("  " + "-" * 44)
+    for p, w in merged:
+        print(
+            f"  {p[0]:+.0f}   {p[1]:+.0f}   {p[2]:+.0f}   {p[3]:+.0f}  {p[4]:7.3f}  {w:.4f}"
+        )
+
+
 def main() -> None:
     run_example1_runtime_table()
     run_example1_checks()
     run_example2_check()
     run_example4_model10_check()
     run_example4_runtime_compare()
+    run_example_logistic()
+    run_example_logistic_aopt()
 
 
 if __name__ == "__main__":
