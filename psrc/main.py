@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.linalg import cho_factor, cho_solve, LinAlgError as ScipyLinAlgError
 
 
 Array = np.ndarray
@@ -37,8 +38,9 @@ class OWEASolver:
         max_newton_iter: int = 60,
     ) -> None:
         self.grid_points = np.asarray(grid_points)
-        self.info_matrices = np.asarray(info_matrices)
-        self.g = np.asarray(g_jacobian)
+        self.info_matrices = np.asarray(info_matrices, dtype=np.float64)
+        self.g = np.asarray(g_jacobian, dtype=np.float64)
+        self.gT = self.g.T.copy()   # k×v, C-contiguous for fast matmul
         self.p = p
         self.eps_opt = eps_opt
         self.eps_weight = eps_weight
@@ -55,19 +57,42 @@ class OWEASolver:
         if info_xi0 is None:
             self.info_xi0 = np.zeros((self.k, self.k))
         else:
-            self.info_xi0 = np.asarray(info_xi0)
+            self.info_xi0 = np.asarray(info_xi0, dtype=np.float64)
 
         total = self.n0 + self.n1
         self.a0 = self.n0 / total
         self.a1 = self.n1 / total
 
-    def _sym(self, m: Array) -> Array:
+        # Precompute flattened info stack: shape (N, k²), row n = info_matrices[n].ravel()
+        # Used for O(1) batch directional-derivative computation via a single matrix-vector product.
+        N = len(self.info_matrices)
+        self.info_stack = self.info_matrices.reshape(N, self.k * self.k)
+
+    # ------------------------------------------------------------------ #
+    #  Low-level helpers                                                   #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _sym(m: Array) -> Array:
         return 0.5 * (m + m.T)
 
-    def _sigma(self, info_total: Array) -> Array:
-        inv_info = np.linalg.inv(self._sym(info_total))
-        sigma = self.g @ inv_info @ self.g.T
-        return self._sym(sigma)
+    @staticmethod
+    def _spd_inv(A: Array) -> Array:
+        S = 0.5 * (A + A.T)
+        try:
+            c, low = cho_factor(S)
+            return cho_solve((c, low), np.eye(S.shape[0]))
+        except ScipyLinAlgError:
+            # Fallback: regularise and retry
+            n = S.shape[0]
+            reg = 1e-12 * np.trace(S) / n
+            for _ in range(6):
+                try:
+                    c, low = cho_factor(S + reg * np.eye(n))
+                    return cho_solve((c, low), np.eye(n))
+                except ScipyLinAlgError:
+                    reg *= 10.0
+            return np.linalg.inv(S)
 
     def _tilde_phi(self, sigma: Array) -> float:
         if self.p == 0:
@@ -75,119 +100,156 @@ class OWEASolver:
             if sign <= 0:
                 return float("inf")
             return float(logdet)
+        if self.p == 1:
+            return float(np.trace(sigma))
         eigvals = np.linalg.eigvalsh(sigma)
-        eigvals = np.clip(eigvals, 1e-18, None)
-        return float(np.sum(eigvals**self.p))
+        np.clip(eigvals, 1e-18, None, out=eigvals)
+        return float(np.sum(eigvals ** self.p))
 
     def _design_info_from_support(self, support_idx: list[int], weights: Array) -> Array:
-        info = np.zeros((self.k, self.k))
-        for w, idx in zip(weights, support_idx):
-            info += float(w) * self.info_matrices[idx]
+        # Vectorised: (m, k, k) weighted sum → (k, k)
+        mats = self.info_matrices[support_idx]          # (m, k, k)
+        info = np.einsum("n,nij->ij", weights, mats)    # one BLAS call
         return self._sym(info)
+
+    def _sigma(self, info_total: Array) -> Array:
+        inv = self._spd_inv(info_total)
+        return self._sym(self.g @ inv @ self.gT)
 
     def _combined_info(self, info_xi: Array) -> Array:
         return self._sym(self.a0 * self.info_xi0 + self.a1 * info_xi)
 
-    def _weight_eval_newton(self, support_idx: list[int], u: Array) -> tuple[float, Array, Array] | None:
-        m = len(support_idx)
-        m1 = m - 1
+    # ------------------------------------------------------------------ #
+    #  Newton weight optimisation                                          #
+    # ------------------------------------------------------------------ #
+
+    def _weight_eval_newton(
+        self,
+        support_idx: list[int],
+        u: Array,
+        deltas: Array,          # precomputed (m-1, k, k) = a1*(I_{xi} - I_{xm})
+    ) -> tuple[float, Array, Array] | None:
+        """Evaluate objective, gradient, and Hessian of tilde_phi w.r.t. u.
+
+        Uses the reformulation from Appendices A.15–A.20 of the paper:
+            C  = g @ inv_T          (v×k)
+            B[i] = C @ Δ[i]        (v×k)
+            F[i] = inv_T @ Δ[i]    (k×k)
+        so that  dΣ/dωᵢ = −B[i] @ Cᵀ  (no extra g factors).
+
+        B and F are stacked as (m1, v, k) and (m1, k, k) for batch einsum.
+        """
+        m1 = len(deltas)
         if m1 <= 0:
             return 0.0, np.zeros(0), np.zeros((0, 0))
-
-        if np.any(u <= 0.0) or np.sum(u) >= 1.0:
+        if np.any(u <= 0.0) or float(u.sum()) >= 1.0:
             return None
 
-        w = np.concatenate([u, np.array([1.0 - float(np.sum(u))])])
-        mats = self.info_matrices[np.asarray(support_idx)]
-        info_xi = np.tensordot(w, mats, axes=(0, 0))
-        info_total = self._combined_info(info_xi)
+        wm = 1.0 - float(u.sum())
+        m = m1 + 1
+        # info_xi from current weights
+        mats = self.info_matrices[support_idx]               # (m, k, k)
+        w_full = np.empty(m)
+        w_full[:m1] = u
+        w_full[m1] = wm
+        info_xi = np.einsum("n,nij->ij", w_full, mats)      # (k, k)
+        info_xi = self._sym(info_xi)
 
+        info_total = self._sym(self.a0 * self.info_xi0 + self.a1 * info_xi)
         try:
-            inv_total = np.linalg.inv(info_total)
-        except np.linalg.LinAlgError:
+            inv_T = self._spd_inv(info_total)
+        except Exception:
             return None
 
-        sigma = self._sym(self.g @ inv_total @ self.g.T)
-        try:
-            if self.p == 0:
-                sign, logdet = np.linalg.slogdet(sigma)
-                if sign <= 0:
-                    return None
-                objective = float(logdet)
-                inv_sigma = np.linalg.inv(sigma)
-            elif self.p == 1:
-                objective = float(np.trace(sigma))
-            else:
-                objective = self._tilde_phi(sigma)
-        except np.linalg.LinAlgError:
-            return None
+        C = self.g @ inv_T                    # (v, k)
+        sigma = self._sym(C @ self.gT)        # (v, v)
 
-        deltas = self.a1 * (mats[:m1] - mats[m - 1])
-        ds = []
-        for i in range(m1):
-            ds_i = -self.g @ inv_total @ deltas[i] @ inv_total @ self.g.T
-            ds.append(self._sym(ds_i))
+        # B[i] = C @ Δ[i], shape (m1, v, k)
+        B = np.einsum("vk,ikl->ivl", C, deltas)    # (m1, v, k)
+        # F[i] = inv_T @ Δ[i], shape (m1, k, k)
+        F = np.einsum("kl,ilj->ikj", inv_T, deltas)  # (m1, k, k)
 
-        grad = np.zeros(m1)
-        hess = np.zeros((m1, m1))
+        grad = np.empty(m1)
+        hess = np.empty((m1, m1))
 
         if self.p == 0:
-            for i in range(m1):
-                grad[i] = float(np.trace(inv_sigma @ ds[i]))
-            for i in range(m1):
-                for j in range(m1):
-                    d2 = self.g @ inv_total @ (
-                        deltas[j] @ inv_total @ deltas[i] + deltas[i] @ inv_total @ deltas[j]
-                    ) @ inv_total @ self.g.T
-                    d2 = self._sym(d2)
-                    hess[i, j] = float(np.trace(inv_sigma @ d2 - inv_sigma @ ds[j] @ inv_sigma @ ds[i]))
-        elif self.p == 1:
-            for i in range(m1):
-                grad[i] = float(np.trace(ds[i]))
-            for i in range(m1):
-                for j in range(m1):
-                    d2 = self.g @ inv_total @ (
-                        deltas[j] @ inv_total @ deltas[i] + deltas[i] @ inv_total @ deltas[j]
-                    ) @ inv_total @ self.g.T
-                    hess[i, j] = float(np.trace(d2))
-        else:
-            # For p > 1, Newton expressions are more involved; we retain a finite-difference Hessian.
-            f0 = objective
-            eps = 1e-6
-            for i in range(m1):
-                up = u.copy()
-                um = u.copy()
-                up[i] += eps
-                um[i] -= eps
-                ep = self._weight_eval_newton(support_idx, up)
-                em = self._weight_eval_newton(support_idx, um)
-                if ep is None or em is None:
-                    return None
-                grad[i] = (ep[0] - em[0]) / (2 * eps)
-            for i in range(m1):
-                for j in range(m1):
-                    u_pp = u.copy()
-                    u_pm = u.copy()
-                    u_mp = u.copy()
-                    u_mm = u.copy()
-                    u_pp[i] += eps
-                    u_pp[j] += eps
-                    u_pm[i] += eps
-                    u_pm[j] -= eps
-                    u_mp[i] -= eps
-                    u_mp[j] += eps
-                    u_mm[i] -= eps
-                    u_mm[j] -= eps
-                    e_pp = self._weight_eval_newton(support_idx, u_pp)
-                    e_pm = self._weight_eval_newton(support_idx, u_pm)
-                    e_mp = self._weight_eval_newton(support_idx, u_mp)
-                    e_mm = self._weight_eval_newton(support_idx, u_mm)
-                    if e_pp is None or e_pm is None or e_mp is None or e_mm is None:
-                        return None
-                    hess[i, j] = (e_pp[0] - e_pm[0] - e_mp[0] + e_mm[0]) / (4 * eps * eps)
-            objective = f0
+            sign, ld = np.linalg.slogdet(sigma)
+            if sign <= 0:
+                return None
+            objective = float(ld)
+            inv_sigma = self._spd_inv(sigma)
 
-        hess = self._sym(hess)
+            # WC = Cᵀ @ Σ⁻¹, shape (k, v)
+            WC = C.T @ inv_sigma                    # (k, v)
+            # grad[i] = −tr(WC @ B[i]) = −einsum(WC, B[i])
+            grad[:] = -np.einsum("kv,ivk->i", WC, B)   # (m1,)
+
+            # Q = WC @ C = Cᵀ Σ⁻¹ C, shape (k, k)
+            Q = WC @ C                              # (k, k)
+            # P[i] = WC @ B[i], shape (m1, k, k)
+            P = np.einsum("kv,ivl->ikl", WC, B)        # (m1, k, k)
+
+            # Hess[i,j] = tr(Q (Δ[j] F[i] + Δ[i] F[j])) − tr(P[j] P[i])
+            #  First term (symmetric in i,j):
+            #   tr(Q Δ[j] F[i]) = einsum("kl,jlm,imk->ij", Q, Δ, F) batched
+            QD = np.einsum("kl,jlm->jkm", Q, deltas)     # (m1, k, k)
+            T1 = np.einsum("ikm,jmk->ij", F, QD) + np.einsum("jkm,imk->ij", F, QD)
+            #  Second term: tr(P[j] @ P[i]) = einsum("jkl,ilk->ij")
+            T2 = np.einsum("jkl,ilk->ij", P, P)
+            hess[:, :] = T1 - T2
+
+        elif self.p == 1:
+            objective = float(np.trace(sigma))
+
+            # grad[i] = tr(dΣ/dωᵢ) = −tr(B[i] Cᵀ) = −tr(Cᵀ B[i])
+            grad[:] = -np.einsum("vk,ivk->i", C, B)     # (m1,)
+
+            # Q1 = Cᵀ C, shape (k, k)
+            Q1 = C.T @ C                            # (k, k)
+            # Hess[i,j] = tr(Q1 (Δ[j] F[i] + Δ[i] F[j]))
+            Q1D = np.einsum("kl,jlm->jkm", Q1, deltas)  # (m1, k, k)
+            hess[:, :] = (
+                np.einsum("ikm,jmk->ij", F, Q1D)
+                + np.einsum("jkm,imk->ij", F, Q1D)
+            )
+
+        else:
+            # General p ≥ 2 — exact formulas from Appendices A.19–A.20
+            objective = self._tilde_phi(sigma)
+            sigma_S = 0.5 * (sigma + sigma.T)
+            # Precompute σ^0 ... σ^{p-1}
+            pows = [np.eye(self.v)]
+            for _ in range(1, self.p):
+                pows.append(pows[-1] @ sigma_S)
+            sigma_pm1 = pows[self.p - 1]
+
+            # Qp = Cᵀ σ^{p-1}, shape (k, v)
+            Qp = C.T @ sigma_pm1              # (k, v)
+            # grad[i] = −p tr(Qp B[i])
+            grad[:] = -self.p * np.einsum("kv,ivk->i", Qp, B)  # (m1,)
+
+            # Hessian first term: p tr(Cᵀ σ^{p-1} C (Δ[j]F[i] + Δ[i]F[j]))
+            Qp_full = Qp @ C                  # (k, k)  = Cᵀ σ^{p-1} C
+            QpD = np.einsum("kl,jlm->jkm", Qp_full, deltas)   # (m1, k, k)
+            T1 = self.p * (
+                np.einsum("ikm,jmk->ij", F, QpD)
+                + np.einsum("jkm,imk->ij", F, QpD)
+            )
+            # Hessian second term: p Σ_{l=0}^{p-2} tr(Cᵀ σ^l B[j] · Cᵀ σ^{p-2-l} B[i])
+            # R[l,i] = Cᵀ σ^l B[i], shape (p-1, m1, k, k)
+            p_minus_2 = self.p - 2
+            R = np.empty((p_minus_2 + 1, m1, self.k, self.k))
+            for l in range(p_minus_2 + 1):
+                # Cᵀ @ pows[l] @ B[i] for each i
+                CpL = C.T @ pows[l]             # (k, v)
+                R[l] = np.einsum("kv,ivl->ikl", CpL, B)    # (m1, k, k)
+            T2 = np.zeros((m1, m1))
+            for l in range(p_minus_2 + 1):
+                l2 = p_minus_2 - l
+                T2 += np.einsum("jkl,ilk->ij", R[l], R[l2])
+            hess[:, :] = T1 + self.p * T2
+
+        hess[:, :] = 0.5 * (hess + hess.T)
         return objective, grad, hess
 
     def _optimize_weights(self, support_idx: list[int], w0: Array | None = None) -> tuple[list[int], Array]:
@@ -213,117 +275,140 @@ class OWEASolver:
             weights = weights / weights.sum()
             u = weights[:-1].copy()
 
+            # Precompute Δ[i] = a1*(I_{x_i} - I_{x_m}) once per support change.
+            Im = self.info_matrices[support[-1]]
+            deltas = self.a1 * (self.info_matrices[support[:-1]] - Im)  # (m-1, k, k)
+
             converged = False
             for _ in range(self.max_newton_iter):
-                cur = self._weight_eval_newton(support, u)
+                cur = self._weight_eval_newton(support, u, deltas)
                 if cur is None:
                     break
                 obj, grad, hess = cur
-                if np.linalg.norm(grad, ord=2) < 1e-9:
+                gnorm = float(np.linalg.norm(grad))
+                # Relative gradient norm — handles objectives of varying scale
+                if gnorm < 1e-8 * (1.0 + abs(obj)):
                     converged = True
                     break
 
                 step = None
                 reg = 0.0
                 ident = np.eye(len(u))
-                for _ in range(7):
+                for _ in range(10):
                     try:
-                        step = np.linalg.solve(hess + reg * ident, grad)
+                        c, low = cho_factor(hess + reg * ident)
+                        step = cho_solve((c, low), grad)
                         break
-                    except np.linalg.LinAlgError:
-                        reg = 1e-10 if reg == 0.0 else reg * 10.0
+                    except ScipyLinAlgError:
+                        reg = max(1e-12, 1e-10 * gnorm) if reg == 0.0 else reg * 10.0
                 if step is None:
-                    break
+                    try:
+                        step = np.linalg.lstsq(hess, grad, rcond=None)[0]
+                    except Exception:
+                        break
 
+                # Back-tracking line search — tolerance scaled by objective magnitude
+                ls_tol = 1e-10 * (1.0 + abs(obj))
                 alpha = 1.0
                 accepted = False
                 while alpha >= 1e-5:
                     u_new = u - alpha * step
-                    if np.any(u_new <= 0.0) or np.sum(u_new) >= 1.0:
+                    if np.any(u_new <= 0.0) or float(u_new.sum()) >= 1.0:
                         alpha *= 0.5
                         continue
-                    nxt = self._weight_eval_newton(support, u_new)
-                    if nxt is not None and nxt[0] <= obj + 1e-14:
+                    nxt = self._weight_eval_newton(support, u_new, deltas)
+                    if nxt is not None and nxt[0] <= obj + ls_tol:
                         u = u_new
                         accepted = True
                         break
                     alpha *= 0.5
 
                 if not accepted:
+                    # If gradient is already negligible relative to scale, treat as converged
+                    if gnorm < 1e-5 * (1.0 + abs(obj)):
+                        converged = True
                     break
 
-            weights = np.concatenate([u, np.array([1.0 - float(np.sum(u))])])
-            weights = np.clip(weights, 0.0, None)
-            if converged and np.all(weights > self.eps_weight):
-                weights = weights / weights.sum()
+            weights = np.empty(m)
+            weights[:-1] = u
+            weights[-1] = 1.0 - float(u.sum())
+            np.clip(weights, 0.0, None, out=weights)
+
+            if converged and bool(np.all(weights > self.eps_weight)):
+                weights /= weights.sum()
                 return support, weights
 
-            # Boundary case in the paper: remove the smallest-weight support point and repeat.
+            # Boundary case: remove smallest-weight support point and repeat.
             if len(support) <= min_support:
-                weights = np.clip(weights, self.eps_weight, None)
-                weights = weights / weights.sum()
+                np.clip(weights, self.eps_weight, None, out=weights)
+                weights /= weights.sum()
                 return support, weights
             rm_idx = int(np.argmin(weights))
             support.pop(rm_idx)
             weights = np.delete(weights, rm_idx)
-            if weights.sum() <= 0.0:
+            s = float(weights.sum())
+            if s <= 0.0:
                 weights = np.full(len(support), 1.0 / len(support))
             else:
-                weights = weights / weights.sum()
+                weights /= s
 
     def _directional_derivatives(self, info_xi: Array, info_total: Array) -> Array:
-        inv_total = np.linalg.inv(info_total)
-        sigma = self._sigma(info_total)
-        c_mat = self.g @ inv_total
+        inv_total = self._spd_inv(info_total)
+        C = self.g @ inv_total               # (v, k)
+        sigma = self._sym(C @ self.gT)       # (v, v)
 
         if self.p == 0:
-            inv_sigma = np.linalg.inv(sigma)
+            inv_sigma = self._spd_inv(sigma)
             w_mat = inv_sigma
         else:
-            sigma_pow_p = np.linalg.matrix_power(sigma, self.p)
-            tr_sigma_pow_p = float(np.trace(sigma_pow_p))
-            scalar = (1.0 / self.v) ** (1.0 / self.p) * (tr_sigma_pow_p ** (1.0 / self.p - 1.0))
-            sigma_pow_pm1 = np.linalg.matrix_power(sigma, self.p - 1)
+            sigma_S = 0.5 * (sigma + sigma.T)
+            sigma_pow_p = np.linalg.matrix_power(sigma_S, self.p)
+            tr_sp = float(np.trace(sigma_pow_p))
+            scalar = (1.0 / self.v) ** (1.0 / self.p) * (tr_sp ** (1.0 / self.p - 1.0))
+            sigma_pow_pm1 = np.linalg.matrix_power(sigma_S, self.p - 1)
             w_mat = scalar * sigma_pow_pm1
 
-        h_mat = c_mat.T @ w_mat @ c_mat
-        base = float(np.trace(h_mat @ info_xi))
-        traces = np.einsum("ij,nji->n", h_mat, self.info_matrices)
-        return self.a1 * (traces - base)
+        # H_mat = Cᵀ W C, shape (k, k)
+        H_mat = C.T @ w_mat @ C              # (k, k)
+        h_vec = H_mat.ravel()                # (k²,)
+
+        # Batch: all_traces[n] = tr(H_mat @ I_x[n]) = h_vec · info_stack[n]
+        all_traces = self.info_stack @ h_vec             # (N,)  — one BLAS gemv
+        base = float(h_vec @ info_xi.ravel())            # tr(H_mat @ I_ξ)
+        return self.a1 * (all_traces - base)
 
     def _greedy_init(self) -> tuple[list[int], Array]:
-        """Greedy Fedorov-style initialization.
-
-        Sequentially selects the k+1 most informative initial points using the
-        trace criterion  Tr(I_curr^{-1} I_x).  A candidate pool of ``20*k``
-        evenly spaced grid points is scanned per round (O(k^2) each), so the
-        total cost is O(k^3 * 20) – negligible even for large grids.
-        """
+        """Greedy Fedorov-style initialization."""
         n = len(self.grid_points)
         k = self.k
         count = min(k + 1, n)
 
         pool_size = min(n, 20 * k)
         step = max(1, n // pool_size)
-        pool = list(range(0, n, step))[:pool_size]
+        pool = np.arange(0, n, step)[:pool_size]
 
-        # Seed: point with the largest Tr(I_x)
-        best_start = int(max(pool, key=lambda i: float(np.trace(self.info_matrices[i]))))
+        # Seed: point with the largest Tr(I_x) — vectorised
+        pool_traces = np.einsum("nii->n", self.info_matrices[pool])  # trace of each pool mat
+        best_start = int(pool[np.argmax(pool_traces)])
         support = [best_start]
         info_curr = self.info_matrices[best_start].copy() + np.eye(k) * 1e-12
 
+        in_support = {best_start}
         for _ in range(count - 1):
-            inv_curr = np.linalg.inv(info_curr)
-            best_gain = -1.0
-            best_i = pool[0]
-            for i in pool:
-                if i in support:
-                    continue
-                gain = float(np.trace(inv_curr @ self.info_matrices[i]))
-                if gain > best_gain:
-                    best_gain = gain
-                    best_i = i
+            inv_curr = self._spd_inv(info_curr)
+            # Batch gains: tr(inv_curr @ I_x[i]) for all i in pool not in support
+            # = einsum("kl,nlk->n", inv_curr, pool_mats)
+            pool_mats = self.info_matrices[pool]                        # (pool_size, k, k)
+            gains = np.einsum("kl,nlk->n", inv_curr, pool_mats)        # one BLAS call
+            # Mask already-selected points
+            for si in in_support:
+                mask_idx = np.where(pool == si)[0]
+                if len(mask_idx):
+                    gains[mask_idx[0]] = -1.0
+            best_local = int(np.argmax(gains))
+            best_i = int(pool[best_local])
             support.append(best_i)
+            in_support.add(best_i)
             info_curr += self.info_matrices[best_i]
 
         weights = np.full(len(support), 1.0 / len(support))
