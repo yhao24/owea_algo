@@ -38,7 +38,10 @@ class OWEASolver:
         max_newton_iter: int = 60,
     ) -> None:
         self.grid_points = np.asarray(grid_points)
-        self.info_matrices = np.asarray(info_matrices, dtype=np.float64)
+        # Preserve float32 input to avoid doubling memory (3.1 GB → 6.2 GB).
+        # Newton weight optimiser promotes to float64 via einsum when mixing dtypes.
+        _im = np.asarray(info_matrices)
+        self.info_matrices = _im if _im.dtype in (np.float32, np.float64) else _im.astype(np.float64)
         self.g = np.asarray(g_jacobian, dtype=np.float64)
         self.gT = self.g.T.copy()   # k×v, C-contiguous for fast matmul
         self.p = p
@@ -373,9 +376,12 @@ class OWEASolver:
         h_vec = H_mat.ravel()                # (k²,)
 
         # Batch: all_traces[n] = tr(H_mat @ I_x[n]) = h_vec · info_stack[n]
-        all_traces = self.info_stack @ h_vec             # (N,)  — one BLAS gemv
-        base = float(h_vec @ info_xi.ravel())            # tr(H_mat @ I_ξ)
-        return self.a1 * (all_traces - base)
+        # Cast h_vec to info_stack dtype (float32 when input was float32) for a
+        # 2× faster BLAS sgemv and half the memory bandwidth on large grids.
+        h_cast = h_vec.astype(self.info_stack.dtype, copy=False)
+        all_traces = self.info_stack @ h_cast            # (N,)  — one BLAS gemv
+        base = float(h_vec @ info_xi.ravel())            # tr(H_mat @ I_ξ) — float64
+        return self.a1 * (all_traces.astype(np.float64, copy=False) - base)
 
     def _greedy_init(self) -> tuple[list[int], Array]:
         """Greedy Fedorov-style initialization."""
@@ -383,7 +389,7 @@ class OWEASolver:
         k = self.k
         count = min(k + 1, n)
 
-        pool_size = min(n, 20 * k)
+        pool_size = min(n, max(20 * k, 2000))
         step = max(1, n // pool_size)
         pool = np.arange(0, n, step)[:pool_size]
 

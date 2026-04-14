@@ -47,10 +47,13 @@ end
 
 struct OWEASolver
     grid_points::Matrix{Float64}
-    info_matrices::Vector{Matrix{Float64}}
-    # Stacked flat info vectors: column n = vec(info_matrices[n])  (k²×N)
-    # Used for batch directional-derivative computation via one gemv.
-    info_stack::Matrix{Float64}
+    # Flat k²×N matrix: column n = vec(I_x[n]).  Replaces Vector{Matrix{Float64}}
+    # to avoid 48 M heap allocations (8.5 GB) vs 6.2 GB for this contiguous store.
+    # Access element n as  reshape(view(s.info_matrices, :, n), s.k, s.k).
+    info_matrices::Matrix{Float64}
+    # Float32 copy of info_matrices for the batch BLAS sgemv in
+    # directional_derivatives!  (3.1 GB).  Float32 is sufficient for argmax.
+    info_stack_f32::Matrix{Float32}
     g::Matrix{Float64}           # v × k
     gT::Matrix{Float64}          # k × v
 
@@ -66,7 +69,7 @@ struct OWEASolver
     max_newton_iter::Int
 
     function OWEASolver(grid_points::AbstractMatrix,
-                        info_matrices::AbstractVector{<:AbstractMatrix},
+                        info_matrices::AbstractMatrix,   # k²×N flat matrix
                         g_jacobian::AbstractMatrix;
                         p::Int = 0,
                         n0::Real = 0.0, n1::Real = 1.0,
@@ -75,28 +78,29 @@ struct OWEASolver
                         eps_weight::Real = 1e-10,
                         max_outer_iter::Int = 300,
                         max_newton_iter::Int = 60)
-        N  = size(grid_points, 1)
-        k  = size(first(info_matrices), 1)
+        kk, N = size(info_matrices)
+        k  = round(Int, sqrt(kk))
+        k * k == kk || error("info_matrices must have k²  rows")
         v  = size(g_jacobian, 1)
         total = Float64(n0) + Float64(n1)
         total > 0 || error("n0 + n1 must be positive")
         I0  = info_xi0 === nothing ? zeros(k, k) : Matrix{Float64}(info_xi0)
         g   = Matrix{Float64}(g_jacobian)
         gp  = Matrix{Float64}(grid_points)
-        ims = [Matrix{Float64}(m) for m in info_matrices]
+        ims = Matrix{Float64}(info_matrices)   # ensure Float64, contiguous
+        stk = Matrix{Float32}(ims)             # Float32 copy for sgemv
 
-        # Build stacked matrix: column n = vec(I_x[n])  (k²×N)
-        stack = Matrix{Float64}(undef, k*k, N)
-        @inbounds for n in 1:N
-            copyto!(view(stack, :, n), vec(ims[n]))
-        end
-
-        new(gp, ims, stack, g, collect(g'), N, k, v, p,
+        new(gp, ims, stk, g, collect(g'), N, k, v, p,
             Float64(n0), Float64(n1), I0,
             Float64(n0)/total, Float64(n1)/total,
             Float64(eps_opt), Float64(eps_weight),
             max_outer_iter, max_newton_iter)
     end
+end
+
+"""Return a view of the n-th info matrix (k×k) from the flat k²×N storage."""
+@inline function _imat(s::OWEASolver, n::Int)
+    reshape(view(s.info_matrices, :, n), s.k, s.k)
 end
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -183,9 +187,11 @@ function design_info!(out::Matrix{Float64}, s::OWEASolver,
                       support::AbstractVector{Int}, w::AbstractVector{Float64})
     fill!(out, 0.0)
     @inbounds for (j, idx) in enumerate(support)
-        wj = w[j]; M = s.info_matrices[idx]
-        for c in axes(M, 2), r in axes(M, 1)
-            out[r,c] += wj * M[r,c]
+        wj = w[j]
+        col = view(s.info_matrices, :, idx)
+        k = s.k
+        for c in 1:k, r in 1:k
+            out[r,c] += wj * col[(c-1)*k + r]
         end
     end
     sym!(out)
@@ -217,15 +223,15 @@ function weight_eval_newton(s::OWEASolver, support::AbstractVector{Int},
     wm = 1.0 - su
 
     k = s.k
-    # Build I_ξ from current weights
+    # Build I_ξ from current weights using flat info_matrices columns
     info_xi = zeros(k, k)
     @inbounds for j in 1:m1
-        M = s.info_matrices[support[j]]
-        for c in 1:k, r in 1:k; info_xi[r,c] += u[j] * M[r,c]; end
+        col = view(s.info_matrices, :, support[j])
+        for c in 1:k, r in 1:k; info_xi[r,c] += u[j] * col[(c-1)*k + r]; end
     end
     @inbounds begin
-        Mm = s.info_matrices[support[m]]
-        for c in 1:k, r in 1:k; info_xi[r,c] += wm * Mm[r,c]; end
+        col_m = view(s.info_matrices, :, support[m])
+        for c in 1:k, r in 1:k; info_xi[r,c] += wm * col_m[(c-1)*k + r]; end
     end
     sym!(info_xi)
 
@@ -369,8 +375,8 @@ function optimize_weights!(s::OWEASolver, support::Vector{Int},
 
         # Precompute Δ[i] = a1*(I_{x_i} - I_{x_m}) once (outside Newton loop).
         # They only change when the support changes.
-        Im = s.info_matrices[support[m]]
-        Δ  = [s.a1 .* (s.info_matrices[support[i]] .- Im) for i in 1:m-1]
+        Im = Matrix(_imat(s, support[m]))
+        Δ  = [s.a1 .* (Matrix(_imat(s, support[i])) .- Im) for i in 1:m-1]
 
         converged = false
         for _ in 1:s.max_newton_iter
@@ -474,15 +480,19 @@ function directional_derivatives!(dvals::Vector{Float64}, s::OWEASolver,
     end
 
     H_mat = C' * W * C    # k×k
-    h     = vec(H_mat)     # k²-vector (column-major, matches info_stack columns)
+    h     = vec(H_mat)     # k²-vector (column-major, matches info_matrices columns)
 
-    # One BLAS gemv: all_traces[n] = dot(h, info_stack[:,n]) = tr(H_mat * I_x[n])
-    all_traces = s.info_stack' * h   # N-vector
+    # BLAS sgemv using Float32 for 2× throughput on large grids.
+    h32        = Float32.(h)
+    all_traces = similar(h32, s.N)       # preallocate Float32 result
+    mul!(all_traces, transpose(s.info_stack_f32), h32)   # in-place sgemv, no alloc
 
     base = dot(h, vec(info_xi))      # tr(H_mat * I_ξ)
 
+    a1 = s.a1
+    base32 = Float32(base)
     @inbounds for n in 1:s.N
-        dvals[n] = s.a1 * (all_traces[n] - base)
+        dvals[n] = a1 * Float64(all_traces[n] - base32)
     end
     dvals
 end
@@ -493,21 +503,22 @@ end
 
 function greedy_init(s::OWEASolver)
     N = s.N; k = s.k; cnt = min(k+1, N)
-    pool_sz = min(N, 20k); step = max(1, N÷pool_sz)
+    pool_sz = min(N, max(20k, 2000)); step = max(1, N÷pool_sz)
     pool = collect(1:step:N); length(pool) > pool_sz && resize!(pool, pool_sz)
 
-    best = pool[argmax([tr(s.info_matrices[i]) for i in pool])]
+    best = pool[argmax([tr(_imat(s, i)) for i in pool])]
     sup  = [best]
-    ic   = copy(s.info_matrices[best])
+    ic   = Matrix(_imat(s, best))
     ic .+= 1e-12 .* Matrix{Float64}(I, k, k)
     for _ in 2:cnt
-        iv = spd_inv(ic); bg = -1.0; bi = pool[1]
+        iv = spd_inv(ic); bg = -1.0; bi = -1
         for i in pool
             i ∈ sup && continue
-            g_cand = trdot(iv, s.info_matrices[i])
+            g_cand = trdot(iv, _imat(s, i))
             g_cand > bg && (bg = g_cand; bi = i)
         end
-        push!(sup, bi); ic .+= s.info_matrices[bi]
+        bi < 0 && break   # no eligible candidate (pool exhausted)
+        push!(sup, bi); ic .+= _imat(s, bi)
     end
     (sup, fill(1.0/length(sup), length(sup)))
 end
@@ -592,6 +603,24 @@ function solve!(s::OWEASolver)::OWEAResult
         tilde_phi(s, sig)
     catch
         Inf
+    end
+
+    # Deduplicate: if the same grid index appears more than once (edge case),
+    # merge by summing the corresponding weights.
+    if length(unique(support)) < length(support)
+        seen   = Dict{Int,Int}()   # grid_index => position in merged arrays
+        m_sup  = Int[]
+        m_wts  = Float64[]
+        for (i, idx) in enumerate(support)
+            if haskey(seen, idx)
+                m_wts[seen[idx]] += weights[i]
+            else
+                seen[idx] = length(m_sup) + 1
+                push!(m_sup, idx); push!(m_wts, weights[i])
+            end
+        end
+        sw = sum(m_wts); sw > 0 && (m_wts ./= sw)
+        support = m_sup; weights = m_wts
     end
 
     OWEAResult(support, s.grid_points[support, :], weights,

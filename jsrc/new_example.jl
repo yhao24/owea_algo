@@ -37,9 +37,11 @@ using LinearAlgebra, Printf
 # ─────────────────────────────────────────────────────────────────────────── #
 
 """
-    logistic_info(X, β) → Vector{Matrix{Float64}}
+    logistic_info(X, β) → Matrix{Float64}  (k²×N)
 
 Fisher information matrices  I(x) = p(x)(1-p(x)) · x xᵀ  for a logistic model.
+Returned as a flat k²×N column-major matrix (column n = vec(I_x[n])) so that
+OWEASolver can store it without any additional allocation.
 
 Arguments
 ---------
@@ -48,13 +50,20 @@ X : (N × k) design matrix with the intercept column already included.
 """
 function logistic_info(X::Matrix{Float64}, β::Vector{Float64})
     N, k = size(X)
-    infos = Vector{Matrix{Float64}}(undef, N)
+    infos = Matrix{Float64}(undef, k*k, N)
     @inbounds for n in 1:N
         row = view(X, n, :)
         xβ  = clamp(dot(row, β), -500.0, 500.0)
         p   = 1.0 / (1.0 + exp(-xβ))
-        f   = sqrt(p * (1.0 - p)) .* row          # k-vector
-        infos[n] = f * f'
+        s   = sqrt(p * (1.0 - p))
+        col = view(infos, :, n)
+        idx = 1
+        for c in 1:k
+            for r in 1:k
+                col[idx] = s * row[r] * s * row[c]
+                idx += 1
+            end
+        end
     end
     return infos
 end
@@ -105,6 +114,7 @@ function run_example1()
     infos = logistic_info(X, β)
 
     for (p_val, label) in [(0, "D"), (1, "A")]
+        GC.gc()   # free any previous solver's info_stack before allocating a new one
         println("\n=== Example 1: 2^7 logistic — $(label)-optimal (p=$(p_val)) ===")
         solver = OWEASolver(grid, infos, Matrix(1.0I, 8, 8);
                             p=p_val, eps_opt=1e-6, max_outer_iter=300)
@@ -167,10 +177,12 @@ function run_example2(; step::Float64 = 0.01)
 
     t1 = time()
     infos = logistic_info(X, β)
-    @printf("Info matrices: computed in %.3fs  (N=%d)\n",
-            time() - t1, size(grid, 1))
+    X = nothing; GC.gc()   # free X (1.5 GB) before the solver loop
+    @printf("Info matrices: %.2f GB  (built in %.3fs,  size %dx%d)\n",
+            sizeof(infos)/1024^3, time() - t1, size(infos, 1), size(infos, 2))
 
     for (p_val, label) in [(0, "D"), (1, "A")]
+        GC.gc()   # free previous solver before allocating a new one
         println("\n=== Example 2: 3-factor logistic — $(label)-optimal (p=$(p_val)) ===")
         solver = OWEASolver(grid, infos, Matrix(1.0I, 4, 4);
                             p=p_val, eps_opt=1e-6, max_outer_iter=300)

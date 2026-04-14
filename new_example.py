@@ -33,7 +33,13 @@ from __future__ import annotations
 
 import itertools
 import math
+import pathlib
+import sys
 import time
+
+# Ensure psrc/ is on the path so `from main import OWEASolver` resolves correctly
+# regardless of the working directory when the script is invoked.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "psrc"))
 
 import numpy as np
 
